@@ -1,0 +1,522 @@
+#include "ofxCoral.h"
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <algorithm>
+#include <cstring>
+
+#include <gst/gst.h>
+#include <gst/app/gstappsink.h>
+#include <glib.h>
+
+// TensorFlow Lite includes
+#include "tensorflow/lite/interpreter.h"
+#include "tensorflow/lite/model.h"
+#include "tensorflow/lite/kernels/register.h"
+#include "tensorflow/lite/builtin_op_data.h"
+#include "tensorflow/lite/optional_debug_tools.h"
+
+#define TFLITE_MINIMAL_CHECK(x) \
+    if (!(x)) { \
+        ofLogError("ofxCoral") << "Error at " << __FILE__ << ":" << __LINE__; \
+        return false; \
+    }
+
+namespace ofxCoral {
+
+// ============================================================================
+// InferenceEngine Implementation
+// ============================================================================
+
+InferenceEngine::~InferenceEngine() {
+    if (edgeTpuDelegate) {
+        edgetpu_free_delegate(edgeTpuDelegate);
+        edgeTpuDelegate = nullptr;
+    }
+}
+
+InferenceEngine::InferenceEngine(InferenceEngine&& other) noexcept
+    : model(std::move(other.model))
+    , interpreter(std::move(other.interpreter))
+    , resolver(std::move(other.resolver))
+    , edgeTpuDelegate(other.edgeTpuDelegate)
+    , labels(std::move(other.labels))
+    , inputWidth(other.inputWidth)
+    , inputHeight(other.inputHeight)
+    , inputChannels(other.inputChannels)
+    , isDetectionModel(other.isDetectionModel) {
+    other.edgeTpuDelegate = nullptr;
+}
+
+InferenceEngine& InferenceEngine::operator=(InferenceEngine&& other) noexcept {
+    if (this != &other) {
+        if (edgeTpuDelegate) {
+            edgetpu_free_delegate(edgeTpuDelegate);
+        }
+        model = std::move(other.model);
+        interpreter = std::move(other.interpreter);
+        resolver = std::move(other.resolver);
+        edgeTpuDelegate = other.edgeTpuDelegate;
+        labels = std::move(other.labels);
+        inputWidth = other.inputWidth;
+        inputHeight = other.inputHeight;
+        inputChannels = other.inputChannels;
+        isDetectionModel = other.isDetectionModel;
+        other.edgeTpuDelegate = nullptr;
+    }
+    return *this;
+}
+
+std::vector<std::string> InferenceEngine::loadLabels(const std::string& labelPath) {
+    std::vector<std::string> result;
+    std::ifstream file(labelPath);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty()) {
+            result.push_back(line);
+        }
+    }
+    return result;
+}
+
+bool InferenceEngine::loadModel(const std::string& modelPath, bool useEdgeTPU) {
+    model = tflite::FlatBufferModel::BuildFromFile(modelPath.c_str());
+    TFLITE_MINIMAL_CHECK(model != nullptr);
+
+    resolver = std::make_unique<tflite::ops::builtin::BuiltinOpResolver>();
+    tflite::InterpreterBuilder(*model, *resolver)(&interpreter);
+    TFLITE_MINIMAL_CHECK(interpreter != nullptr);
+
+    if (useEdgeTPU) {
+        size_t num_devices = 0;
+        edgetpu_device* devices = edgetpu_list_devices(&num_devices);
+        if (num_devices > 0 && devices) {
+            edgeTpuDelegate = edgetpu_create_delegate(devices[0].type, devices[0].path, nullptr, 0);
+            edgetpu_free_devices(devices);
+            if (edgeTpuDelegate) {
+                interpreter->ModifyGraphWithDelegate({edgeTpuDelegate, edgetpu_free_delegate});
+                ofLogNotice("ofxCoral") << "Edge TPU delegate attached";
+            } else {
+                ofLogWarning("ofxCoral") << "Failed to create Edge TPU delegate, falling back to CPU";
+            }
+        } else {
+            ofLogWarning("ofxCoral") << "No Edge TPU devices found, using CPU";
+        }
+    }
+
+    interpreter->SetNumThreads(1);
+    TFLITE_MINIMAL_CHECK(interpreter->AllocateTensors() == kTfLiteOk);
+
+    // Get input tensor details
+    const auto& input_indices = interpreter->inputs();
+    TFLITE_MINIMAL_CHECK(!input_indices.empty());
+    const TfLiteTensor* input_tensor = interpreter->tensor(input_indices[0]);
+    TFLITE_MINIMAL_CHECK(input_tensor != nullptr);
+
+    inputHeight = input_tensor->dims->data[1];
+    inputWidth = input_tensor->dims->data[2];
+    inputChannels = input_tensor->dims->data[3];
+
+    // Determine if detection model (has 4 output tensors or specific output shape)
+    const auto& output_indices = interpreter->outputs();
+    isDetectionModel = (output_indices.size() >= 3); // SSD typically has 4 outputs
+
+    ofLogNotice("ofxCoral") << "Model loaded: " << inputWidth << "x" << inputHeight << "x" << inputChannels
+                            << ", detection=" << isDetectionModel;
+    return true;
+}
+
+bool InferenceEngine::setup(const std::string& modelPath, const std::string& labelPath, bool useEdgeTPU) {
+    labels = loadLabels(labelPath);
+    if (labels.empty()) {
+        ofLogError("ofxCoral") << "No labels loaded from " << labelPath;
+        return false;
+    }
+    ofLogNotice("ofxCoral") << "Loaded " << labels.size() << " labels";
+
+    return loadModel(modelPath, useEdgeTPU);
+}
+
+std::vector<Classification> InferenceEngine::classify(const unsigned char* rgbData, int width, int height) {
+    std::vector<Classification> results;
+    if (!interpreter || !rgbData) return results;
+
+    // Get input tensor
+    const auto& input_indices = interpreter->inputs();
+    uint8_t* input = interpreter->typed_input_tensor<uint8_t>(0);
+
+    // Resize and copy image data (simple nearest neighbor for now)
+    int inputSize = inputWidth * inputHeight * inputChannels;
+    if (width == inputWidth && height == inputHeight && inputChannels == 3) {
+        std::memcpy(input, rgbData, inputSize);
+    } else {
+        // Simple resize - in production use proper image scaling
+        for (int y = 0; y < inputHeight; ++y) {
+            for (int x = 0; x < inputWidth; ++x) {
+                int srcX = (x * width) / inputWidth;
+                int srcY = (y * height) / inputHeight;
+                int srcIdx = (srcY * width + srcX) * 3;
+                int dstIdx = (y * inputWidth + x) * 3;
+                if (srcIdx + 2 < width * height * 3 && dstIdx + 2 < inputSize) {
+                    input[dstIdx] = rgbData[srcIdx];
+                    input[dstIdx + 1] = rgbData[srcIdx + 1];
+                    input[dstIdx + 2] = rgbData[srcIdx + 2];
+                }
+            }
+        }
+    }
+
+    TFLITE_MINIMAL_CHECK(interpreter->Invoke() == kTfLiteOk);
+
+    // Get output
+    const auto& output_indices = interpreter->outputs();
+    const TfLiteTensor* output_tensor = interpreter->tensor(output_indices[0]);
+
+    if (output_tensor->type == kTfLiteUInt8) {
+        const uint8_t* output = interpreter->typed_output_tensor<uint8_t>(0);
+        int num_classes = output_tensor->bytes;
+        float scale = output_tensor->params.scale;
+        int zero_point = output_tensor->params.zero_point;
+
+        // Find top 5
+        std::vector<std::pair<int, float>> scores;
+        scores.reserve(num_classes);
+        for (int i = 0; i < num_classes; ++i) {
+            float prob = (output[i] - zero_point) * scale;
+            if (prob > 0.01f) { // threshold
+                scores.emplace_back(i, prob);
+            }
+        }
+        std::sort(scores.begin(), scores.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+
+        for (size_t i = 0; i < std::min(size_t(5), scores.size()); ++i) {
+            int idx = scores[i].first;
+            if (idx < (int)labels.size()) {
+                results.push_back({labels[idx], scores[i].second});
+            }
+        }
+    } else if (output_tensor->type == kTfLiteFloat32) {
+        const float* output = interpreter->typed_output_tensor<float>(0);
+        int num_classes = output_tensor->bytes / sizeof(float);
+
+        std::vector<std::pair<int, float>> scores;
+        scores.reserve(num_classes);
+        for (int i = 0; i < num_classes; ++i) {
+            if (output[i] > 0.01f) {
+                scores.emplace_back(i, output[i]);
+            }
+        }
+        std::sort(scores.begin(), scores.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+
+        for (size_t i = 0; i < std::min(size_t(5), scores.size()); ++i) {
+            int idx = scores[i].first;
+            if (idx < (int)labels.size()) {
+                results.push_back({labels[idx], scores[i].second});
+            }
+        }
+    }
+
+    return results;
+}
+
+std::vector<Detection> InferenceEngine::detect(const unsigned char* rgbData, int width, int height) {
+    std::vector<Detection> results;
+    if (!interpreter || !rgbData || !isDetectionModel) return results;
+
+    // Same input preparation as classify
+    const auto& input_indices = interpreter->inputs();
+    uint8_t* input = interpreter->typed_input_tensor<uint8_t>(0);
+    int inputSize = inputWidth * inputHeight * inputChannels;
+
+    if (width == inputWidth && height == inputHeight && inputChannels == 3) {
+        std::memcpy(input, rgbData, inputSize);
+    } else {
+        for (int y = 0; y < inputHeight; ++y) {
+            for (int x = 0; x < inputWidth; ++x) {
+                int srcX = (x * width) / inputWidth;
+                int srcY = (y * height) / inputHeight;
+                int srcIdx = (srcY * width + srcX) * 3;
+                int dstIdx = (y * inputWidth + x) * 3;
+                if (srcIdx + 2 < width * height * 3 && dstIdx + 2 < inputSize) {
+                    input[dstIdx] = rgbData[srcIdx];
+                    input[dstIdx + 1] = rgbData[srcIdx + 1];
+                    input[dstIdx + 2] = rgbData[srcIdx + 2];
+                }
+            }
+        }
+    }
+
+    TFLITE_MINIMAL_CHECK(interpreter->Invoke() == kTfLiteOk);
+
+    // SSD output: typically 4 tensors [num_detections, detection_boxes, detection_classes, detection_scores]
+    const auto& output_indices = interpreter->outputs();
+    if (output_indices.size() < 3) return results;
+
+    // Parse outputs (format varies by model)
+    // This is a simplified version - real implementation needs to match specific model output format
+    const TfLiteTensor* boxes_tensor = interpreter->tensor(output_indices[0]);
+    const TfLiteTensor* classes_tensor = interpreter->tensor(output_indices[1]);
+    const TfLiteTensor* scores_tensor = interpreter->tensor(output_indices[2]);
+    const TfLiteTensor* num_tensor = (output_indices.size() > 3) ? interpreter->tensor(output_indices[3]) : nullptr;
+
+    int num_detections = num_tensor ? static_cast<int>(*interpreter->typed_output_tensor<float>(3)) : 100;
+
+    if (boxes_tensor && classes_tensor && scores_tensor) {
+        const float* boxes = interpreter->typed_output_tensor<float>(0);
+        const float* classes = interpreter->typed_output_tensor<float>(1);
+        const float* scores = interpreter->typed_output_tensor<float>(2);
+
+        for (int i = 0; i < num_detections && i < 100; ++i) {
+            float score = scores[i];
+            if (score > 0.3f) { // threshold
+                int class_id = static_cast<int>(classes[i]);
+                if (class_id >= 0 && class_id < (int)labels.size()) {
+                    Detection det;
+                    det.label = labels[class_id];
+                    det.confidence = score;
+                    det.y = boxes[i * 4 + 0];     // ymin
+                    det.x = boxes[i * 4 + 1];     // xmin
+                    det.height = boxes[i * 4 + 2] - boxes[i * 4 + 0]; // ymax - ymin
+                    det.width = boxes[i * 4 + 3] - boxes[i * 4 + 1];  // xmax - xmin
+                    results.push_back(det);
+                }
+            }
+        }
+    }
+
+    return results;
+}
+
+// ============================================================================
+// CameraStreamer Implementation
+// ============================================================================
+
+struct CameraStreamer::Impl {
+    GMainLoop* loop = nullptr;
+    GstElement* pipeline = nullptr;
+    GstElement* appsink = nullptr;
+    std::thread gstThread;
+    std::atomic<bool> shouldStop{false};
+    int width = 640;
+    int height = 480;
+    std::string device = "/dev/video0";
+};
+
+CameraStreamer::~CameraStreamer() {
+    stop();
+}
+
+bool CameraStreamer::setup(int w, int h, int fps, const std::string& dev) {
+    if (!impl) impl = std::make_unique<Impl>();
+    impl->width = w;
+    impl->height = h;
+    impl->device = dev;
+
+    // Initialize GStreamer
+    static std::once_flag gstInitFlag;
+    std::call_once(gstInitFlag, []() { gst_init(nullptr, nullptr); });
+
+    return true;
+}
+
+static GstFlowReturn on_new_sample(GstElement* sink, void* userData) {
+    CameraStreamer* self = static_cast<CameraStreamer*>(userData);
+    if (!self || !self->impl) return GST_FLOW_OK;
+
+    GstSample* sample = nullptr;
+    g_signal_emit_by_name(sink, "pull-sample", &sample);
+    if (!sample) return GST_FLOW_OK;
+
+    GstBuffer* buffer = gst_sample_get_buffer(sample);
+    if (!buffer) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    GstMapInfo map;
+    if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        // Get caps to determine format
+        GstCaps* caps = gst_sample_get_caps(sample);
+        GstStructure* structure = gst_caps_get_structure(caps, 0);
+        int width = 0, height = 0;
+        gst_structure_get_int(structure, "width", &width);
+        gst_structure_get_int(structure, "height", &height);
+
+        // Call user callback with RGB data
+        if (self->frameCallback) {
+            self->frameCallback(map.data, width, height, 3); // Assuming RGB
+        }
+
+        gst_buffer_unmap(buffer, &map);
+    }
+
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
+
+static gboolean on_bus_message(GstBus* bus, GstMessage* msg, void* userData) {
+    CameraStreamer* self = static_cast<CameraStreamer*>(userData);
+    if (!self) return TRUE;
+
+    switch (GST_MESSAGE_TYPE(msg)) {
+        case GST_MESSAGE_EOS:
+            ofLogNotice("ofxCoral") << "Camera stream ended";
+            self->stop();
+            break;
+        case GST_MESSAGE_ERROR: {
+            GError* err = nullptr;
+            gst_message_parse_error(msg, &err, nullptr);
+            ofLogError("ofxCoral") << "GStreamer error: " << (err ? err->message : "unknown");
+            if (err) g_error_free(err);
+            self->stop();
+            break;
+        }
+        case GST_MESSAGE_WARNING: {
+            GError* err = nullptr;
+            gst_message_parse_warning(msg, &err, nullptr);
+            ofLogWarning("ofxCoral") << "GStreamer warning: " << (err ? err->message : "unknown");
+            if (err) g_error_free(err);
+            break;
+        }
+        default:
+            break;
+    }
+    return TRUE;
+}
+
+void* CameraStreamer::gstThreadFunc(void* userData) {
+    CameraStreamer* self = static_cast<CameraStreamer*>(userData);
+    if (!self || !self->impl) return nullptr;
+
+    auto& impl = *self->impl;
+    impl.loop = g_main_loop_new(nullptr, FALSE);
+
+    // Build pipeline string
+    std::string pipelineStr =
+        "v4l2src device=" + impl->device + " ! " +
+        "video/x-raw,framerate=30/1,width=" + std::to_string(impl->width) +
+        ",height=" + std::to_string(impl->height) + " ! " +
+        "videoconvert ! video/x-raw,format=RGB ! " +
+        "appsink name=appsink emit-signals=true max-buffers=1 drop=true";
+
+    impl.pipeline = gst_parse_launch(pipelineStr.c_str(), nullptr);
+    if (!impl.pipeline) {
+        ofLogError("ofxCoral") << "Failed to create pipeline: " << pipelineStr;
+        return nullptr;
+    }
+
+    impl.appsink = gst_bin_get_by_name(GST_BIN(impl.pipeline), "appsink");
+    if (impl.appsink) {
+        g_signal_connect(impl.appsink, "new-sample", G_CALLBACK(on_new_sample), self);
+    }
+
+    GstBus* bus = gst_element_get_bus(impl.pipeline);
+    gst_bus_add_watch(bus, on_bus_message, self);
+    gst_object_unref(bus);
+
+    GstStateChangeReturn ret = gst_element_set_state(impl.pipeline, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        ofLogError("ofxCoral") << "Failed to start pipeline";
+        gst_object_unref(impl.pipeline);
+        impl.pipeline = nullptr;
+        return nullptr;
+    }
+
+    g_main_loop_run(impl.loop);
+
+    // Cleanup
+    gst_element_set_state(impl.pipeline, GST_STATE_NULL);
+    gst_object_unref(impl.pipeline);
+    impl.pipeline = nullptr;
+    if (impl.appsink) {
+        gst_object_unref(impl.appsink);
+        impl.appsink = nullptr;
+    }
+    g_main_loop_unref(impl.loop);
+    impl.loop = nullptr;
+
+    return nullptr;
+}
+
+void CameraStreamer::start(FrameCallback callback) {
+    if (running || !impl) return;
+    frameCallback = callback;
+    running = true;
+    impl->gstThread = std::thread(gstThreadFunc, this);
+}
+
+void CameraStreamer::stop() {
+    if (!running || !impl) return;
+    running = false;
+
+    if (impl->loop) {
+        g_main_loop_quit(impl->loop);
+    }
+    if (impl->gstThread.joinable()) {
+        impl->gstThread.join();
+    }
+    frameCallback = nullptr;
+}
+
+// ============================================================================
+// ofxCoral Main Class Implementation
+// ============================================================================
+
+ofxCoral::~ofxCoral() {
+    stop();
+}
+
+bool ofxCoral::setup(const std::string& modelPath, const std::string& labelPath, bool useEdgeTPU) {
+    return engine.setup(modelPath, labelPath, useEdgeTPU);
+}
+
+bool ofxCoral::setupCamera(int width, int height, int fps, const std::string& device) {
+    return camera.setup(width, height, fps, device);
+}
+
+void ofxCoral::start() {
+    if (!engine.isReady()) {
+        ofLogError("ofxCoral") << "Engine not ready, call setup() first";
+        return;
+    }
+
+    useDetection = engine.isDetectionModel;
+
+    camera.start([this](const unsigned char* pixels, int width, int height, int channels) {
+        if (useDetection) {
+            lastDetections = engine.detect(pixels, width, height);
+            if (onDetection) onDetection(lastDetections);
+        } else {
+            lastClassifications = engine.classify(pixels, width, height);
+            if (onClassification) onClassification(lastClassifications);
+        }
+    });
+}
+
+void ofxCoral::stop() {
+    camera.stop();
+}
+
+void ofxCoral::update() {
+    // Called from main thread - callbacks already fired from camera thread
+    // Could add thread-safe queue here if needed
+}
+
+std::vector<Classification> ofxCoral::classify(const ofPixels& pixels) {
+    if (pixels.getNumChannels() == 3) {
+        return engine.classify(pixels.getData(), pixels.getWidth(), pixels.getHeight());
+    }
+    return {};
+}
+
+std::vector<Detection> ofxCoral::detect(const ofPixels& pixels) {
+    if (pixels.getNumChannels() == 3) {
+        return engine.detect(pixels.getData(), pixels.getWidth(), pixels.getHeight());
+    }
+    return {};
+}
+
+} // namespace ofxCoral

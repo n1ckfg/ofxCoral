@@ -1,0 +1,88 @@
+#pragma once
+
+#include "ofMain.h"
+#include <vector>
+#include <functional>
+
+namespace ofxCoral {
+
+struct Detection {
+    std::string label;
+    float confidence;
+    float x, y, width, height; // normalized 0-1
+};
+
+struct Classification {
+    std::string label;
+    float confidence;
+};
+
+class InferenceEngine {
+public:
+    InferenceEngine();
+    ~InferenceEngine();
+
+    InferenceEngine(const InferenceEngine&) = delete;
+    InferenceEngine& operator=(const InferenceEngine&) = delete;
+    InferenceEngine(InferenceEngine&&) noexcept;
+    InferenceEngine& operator=(InferenceEngine&&) noexcept;
+
+    bool setup(const std::string& modelPath, const std::string& labelPath, bool useEdgeTPU = true);
+    bool isReady() const;
+    bool isDetectionModel() const;
+
+    std::vector<Classification> classify(const unsigned char* rgbData, int width, int height);
+    std::vector<Detection> detect(const unsigned char* rgbData, int width, int height);
+
+    int getInputWidth() const;
+    int getInputHeight() const;
+    int getInputChannels() const;
+};
+
+class CameraStreamer {
+public:
+    using FrameCallback = std::function<void(const unsigned char* pixels, int width, int height, int channels)>;
+
+    CameraStreamer();
+    ~CameraStreamer();
+
+    CameraStreamer(const CameraStreamer&) = delete;
+    CameraStreamer& operator=(const CameraStreamer&) = delete;
+    CameraStreamer(CameraStreamer&&) noexcept;
+    CameraStreamer& operator=(CameraStreamer&&) noexcept;
+
+    bool setup(int width = 640, int height = 480, int fps = 30, const std::string& device = "/dev/video0");
+    void start(FrameCallback callback);
+    void stop();
+    bool isRunning() const;
+};
+
+class ofxCoral {
+public:
+    ofxCoral();
+    ~ofxCoral();
+
+    ofxCoral(const ofxCoral&) = delete;
+    ofxCoral& operator=(const ofxCoral&) = delete;
+    ofxCoral(ofxCoral&&) noexcept;
+    ofxCoral& operator=(ofxCoral&&) noexcept;
+
+    bool setup(const std::string& modelPath, const std::string& labelPath, bool useEdgeTPU = true);
+    bool setupCamera(int width = 640, int height = 480, int fps = 30, const std::string& device = "/dev/video0");
+    void start();
+    void stop();
+    void update();
+
+    std::function<void(const std::vector<Classification>&)> onClassification;
+    std::function<void(const std::vector<Detection>&)> onDetection;
+
+    bool isReady() const;
+    bool isRunning() const;
+    int getInputWidth() const;
+    int getInputHeight() const;
+
+    std::vector<Classification> classify(const ofPixels& pixels);
+    std::vector<Detection> detect(const ofPixels& pixels);
+};
+
+} // namespace ofxCoral

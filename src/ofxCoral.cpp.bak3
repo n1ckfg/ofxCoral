@@ -1,0 +1,155 @@
+#include "ofxCoral.h"
+
+namespace ofxCoral {
+
+// InferenceEngine implementation
+InferenceEngine::InferenceEngine() : ready_(false), isDetectionModel_(false),
+    inputWidth_(224), inputHeight_(224), inputChannels_(3) {}
+InferenceEngine::~InferenceEngine() = default;
+
+bool InferenceEngine::setup(const std::string& modelPath, const std::string& labelPath, bool useEdgeTPU) {
+    ofLogNotice("ofxCoral") << "InferenceEngine::setup called (stub)";
+    (void)modelPath;
+    (void)labelPath;
+    (void)useEdgeTPU;
+    // Pretend we loaded a model successfully
+    ready_ = true;
+    isDetectionModel_ = false; // Assume classification model for stub
+    return true;
+}
+
+bool InferenceEngine::isReady() const {
+    return ready_;
+}
+
+bool InferenceEngine::isDetectionModel() const {
+    return isDetectionModel_;
+}
+
+std::vector<Classification> InferenceEngine::classify(const unsigned char* rgbData, int width, int height) {
+    (void)rgbData;
+    (void)width;
+    (void)height;
+    return {};
+}
+
+std::vector<Detection> InferenceEngine::detect(const unsigned char* rgbData, int width, int height) {
+    (void)rgbData;
+    (void)width;
+    (void)height;
+    return {};
+}
+
+int InferenceEngine::getInputWidth() const {
+    return inputWidth_;
+}
+
+int InferenceEngine::getInputHeight() const {
+    return inputHeight_;
+}
+
+int InferenceEngine::getInputChannels() const {
+    return inputChannels_;
+}
+
+// CameraStreamer implementation
+CameraStreamer::CameraStreamer() : running_(false) {}
+CameraStreamer::~CameraStreamer() = default;
+
+bool CameraStreamer::setup(int width, int height, int fps, const std::string& device) {
+    ofLogNotice("ofxCoral") << "CameraStreamer::setup called (stub)";
+    (void)width;
+    (void)height;
+    (void)fps;
+    (void)device;
+    running_ = false;
+    return true;
+}
+
+void CameraStreamer::start(FrameCallback callback) {
+    ofLogNotice("ofxCoral") << "CameraStreamer::start called (stub)";
+    (void)callback;
+    running_ = true;
+}
+
+void CameraStreamer::stop() {
+    ofLogNotice("ofxCoral") << "CameraStreamer::stop called (stub)";
+    running_ = false;
+}
+
+bool CameraStreamer::isRunning() const {
+    return running_;
+}
+
+// ofxCoral implementation
+ofxCoral::ofxCoral() = default;
+ofxCoral::~ofxCoral() = default;
+
+bool ofxCoral::setup(const std::string& modelPath, const std::string& labelPath, bool useEdgeTPU) {
+    return engine_.setup(modelPath, labelPath, useEdgeTPU);
+}
+
+bool ofxCoral::setupCamera(int width, int height, int fps, const std::string& device) {
+    return camera_.setup(width, height, fps, device);
+}
+
+void ofxCoral::start() {
+    ofLogNotice("ofxCoral") << "ofxCoral::start called";
+    if (!engine_.isReady()) {
+        ofLogError("ofxCoral") << "Engine not ready";
+        return;
+    }
+    useDetection_ = engine_.isDetectionModel();
+    camera_.start([this](const unsigned char* pixels, int width, int height, int channels) {
+        if (useDetection_) {
+            lastDetections_ = engine_.detect(pixels, width, height);
+            if (onDetection) onDetection(lastDetections_);
+        } else {
+            lastClassifications_ = engine_.classify(pixels, width, height);
+            if (onClassification) onClassification(lastClassifications_);
+        }
+    });
+}
+
+void ofxCoral::stop() {
+    ofLogNotice("ofxCoral") << "ofxCoral::stop called";
+    camera_.stop();
+}
+
+void ofxCoral::update() {
+    ofLogNotice("ofxCoral") << "ofxCoral::update called";
+    // In a real implementation, we would update the engine and camera here.
+    // For the stub, we do nothing.
+}
+
+bool ofxCoral::isReady() const {
+    return engine_.isReady();
+}
+
+bool ofxCoral::isRunning() const {
+    return camera_.isRunning();
+}
+
+int ofxCoral::getInputWidth() const {
+    return engine_.getInputWidth();
+}
+
+int ofxCoral::getInputHeight() const {
+    return engine_.getInputHeight();
+}
+
+std::vector<Classification> ofxCoral::classify(const ofPixels& pixels) {
+    if (pixels.getNumChannels() == 3) {
+        return engine_.classify(pixels.getData(), pixels.getWidth(), pixels.getHeight());
+    }
+    return {};
+}
+
+std::vector<Detection> ofxCoral::detect(const ofPixels& pixels) {
+    if (pixels.getNumChannels() == 3) {
+        return engine_.detect(pixels.getData(), pixels.getWidth(), pixels.getHeight());
+    }
+    return {};
+}
+
+} // namespace ofxCoral
