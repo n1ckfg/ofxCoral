@@ -21,7 +21,7 @@ struct Classification {
 
 class InferenceEngine {
 public:
-    InferenceEngine() = default;
+    InferenceEngine();
     ~InferenceEngine();
 
     InferenceEngine(const InferenceEngine&) = delete;
@@ -52,7 +52,7 @@ class CameraStreamer {
 public:
     using FrameCallback = std::function<void(const unsigned char* pixels, int width, int height, int channels)>;
 
-    CameraStreamer() = default;
+    CameraStreamer();
     ~CameraStreamer();
 
     CameraStreamer(const CameraStreamer&) = delete;
@@ -69,7 +69,7 @@ private:
 
 class ofxCoral {
 public:
-    ofxCoral() = default;
+    ofxCoral();
     ~ofxCoral();
 
     bool setup(const std::string& modelPath, const std::string& labelPath, bool useEdgeTPU = true);
